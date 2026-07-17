@@ -126,7 +126,8 @@ def sample_job_attributes(rng: np.random.Generator, job_id: int, arrival_time: f
 
     # Choose a route
     route_weights = [w for w, _ in ROUTES]
-    chosen_route = rng.choice([r for _, r in ROUTES], p=np.array(route_weights)/sum(route_weights))
+    route_index = rng.choice(len(ROUTES), p=np.array(route_weights)/sum(route_weights))
+    chosen_route = ROUTES[route_index][1]
 
     operations = []
     for op_type, op_mean, op_cv in chosen_route:
