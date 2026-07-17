@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Job‑Shop Visualizer – Python in Browser</title>
+    <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+    <div id="loading">
+        <div class="spinner"></div>
+        <div id="loadStatus">Loading Python (Pyodide) …</div>
+    </div>
+
+    <div id="app">
+        <div id="controls">
+            <span class="clock" id="simClock">Time 0.0 h</span>
+            <button class="btn primary" id="runBtn">Run Simulation</button>
+            <button class="btn" id="playBtn" disabled>Play</button>
+            <button class="btn" id="stepBackBtn" disabled>Back</button>
+            <button class="btn" id="stepBtn" disabled>Step</button>
+            <select id="scenarioSelect">
+                <option value="base">Base (FIFO)</option>
+                <option value="capacity">Capacity (13 Mach)</option>
+                <option value="priority">Priority</option>
+                <option value="demand">Demand Surge</option>
+                <option value="priority_demand">Priority + Demand</option>
+            </select>
+            <div id="speedControl">
+                <label for="speedSlider">Speed</label>
+                <input type="range" id="speedSlider" min="1" max="10" value="4" />
+            </div>
+            <button class="btn guide-btn" id="guideToggle">Guide</button>
+        </div>
+
+        <div id="guidePanel">
+            <h3>Simulation Parameter Guide</h3>
+
+            <h4>Scenario Configurations</h4>
+            <table>
+                <thead>
+                    <tr><th>Parameter</th><th>Base</th><th>Capacity</th><th>Priority</th><th>Demand Surge</th><th>P + Demand</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td>Machines</td><td>10</td><td class="highlight">13</td><td>10</td><td>10</td><td>10</td></tr>
+                    <tr><td>Buffer Capacity</td><td>8</td><td class="highlight">10</td><td>8</td><td>8</td><td>8</td></tr>
+                    <tr><td>Arrival Mean (λ)</td><td>0.45 h</td><td>0.45 h</td><td>0.45 h</td><td class="highlight">0.35 h</td><td class="highlight">0.35 h</td></tr>
+                    <tr><td>Queue Discipline</td><td>FIFO</td><td>FIFO</td><td class="highlight">PRIORITY</td><td>FIFO</td><td class="highlight">PRIORITY</td></tr>
+                </tbody>
+            </table>
+
+            <h4>Job Types</h4>
+            <table>
+                <thead><tr><th>Type</th><th>Probability</th><th>Mean Processing (h)</th><th>Subtypes</th></tr></thead>
+                <tbody>
+                    <tr><td>Standard</td><td>0.25</td><td>3.0</td><td>SingleOp, TwoOp, ThreeOp</td></tr>
+                    <tr><td>Precision</td><td>0.20</td><td>5.0</td><td>TightTolerance, UltraPrecision, MultiAxis</td></tr>
+                    <tr><td>Bulk</td><td>0.20</td><td>1.5</td><td>SmallBatch, MediumBatch, LargeBatch</td></tr>
+                    <tr><td>Rush</td><td>0.20</td><td>2.25</td><td>SingleItem, SmallLot</td></tr>
+                    <tr><td>Custom</td><td>0.15</td><td>6.5</td><td>Prototype, OneOff, EngineeringChange</td></tr>
+                </tbody>
+            </table>
+            <p style="font-size:12px;color:#8b949e;margin:4px 0 0 0;">
+                Processing time follows a Log‑Normal distribution with CV = 0.35.
+            </p>
+
+            <h4>Priority Classes</h4>
+            <table>
+                <thead><tr><th>Class</th><th>Probability</th><th>Weight</th></tr></thead>
+                <tbody>
+                    <tr><td><span class="tag tag-low">Low</span></td><td>0.30</td><td>1</td></tr>
+                    <tr><td><span class="tag tag-standard">Standard</span></td><td>0.40</td><td>2</td></tr>
+                    <tr><td><span class="tag tag-high">High</span></td><td>0.20</td><td>3</td></tr>
+                    <tr><td><span class="tag tag-critical">Critical</span></td><td>0.10</td><td>5</td></tr>
+                </tbody>
+            </table>
+
+            <h4>Rejection Reasons</h4>
+            <ul>
+                <li><strong style="color:#f85149;">Buffer Full</strong> – No space in the queue when a job arrives.</li>
+                <li><strong style="color:#d29922;">Timeout</strong> – Job exceeds its wait tolerance.</li>
+                <li><strong style="color:#da3633;">Machine Fail</strong> – Job is scrapped during a machine breakdown (25% chance).</li>
+                <li><strong style="color:#bc4cff;">Quality Reject</strong> – Job fails final quality inspection.</li>
+            </ul>
+
+            <h4>Key Formulas</h4>
+            <ul>
+                <li><strong>Complexity</strong> = Base Complexity + Quality Risk (Beta(2,2) scaled to 0–2)</li>
+                <li><strong>Priority Level</strong> = 0.6 × Weight + 0.4 × (Complexity / 7 × 5)</li>
+                <li><strong>Safe Wait Mean</strong> = max(0.5, 10 / (1 + Priority Level))  → higher priority = shorter tolerance</li>
+                <li><strong>Quality Scrap Prob</strong> = min(0.20, 0.02 × Complexity)</li>
+                <li><strong>Time‑to‑Failure</strong> = Exponential(mean 120 h) &nbsp;|&nbsp; <strong>Repair Time</strong> = Uniform(1, 4) h</li>
+            </ul>
+            <p style="font-size:12px;color:#8b949e;margin:6px 0 0 0;">
+                Inspection time follows Gamma(mean 0.25 h, sd 0.08 h) truncated at 0.05 h.
+            </p>
+        </div>
+
+        <div id="simArea">
+            <div id="leftCol">
+                <div>
+                    <div class="section-title">Machines</div>
+                    <div id="machinesGrid"></div>
+                </div>
+                <div>
+                    <div class="section-title">Buffer <span id="bufferCount" style="font-weight:400;color:#8b949e;font-size:11px;text-transform:none;"></span></div>
+                    <div id="bufferArea"></div>
+                </div>
+            </div>
+            <div id="rightCol">
+                <div>
+                    <div class="section-title">Rejections</div>
+                    <div id="rejectionBins"></div>
+                </div>
+                <div>
+                    <div class="section-title">Metrics</div>
+                    <div id="gauges">
+                        <div class="gauge">
+                            <span class="label">Utilization</span>
+                            <span class="value" id="utilVal">0%</span>
+                            <div class="bar-track"><div class="bar-fill util" id="utilBar" style="width:0%"></div></div>
+                        </div>
+                        <div class="gauge">
+                            <span class="label">Queue</span>
+                            <span class="value" id="queueVal">0</span>
+                            <div class="bar-track"><div class="bar-fill queue" id="queueBar" style="width:0%"></div></div>
+                        </div>
+                        <div class="gauge">
+                            <span class="label">Completed</span>
+                            <span class="value" id="completedVal">0</span>
+                        </div>
+                        <canvas id="sparkline"></canvas>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/pyodide/v0.27.2/full/pyodide.js">
+    </script>
+    <script src="script.js">
+    </script>
+</body>
+</html>

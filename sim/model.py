@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict
+import json
 
 # --------------------------------------------------------------------------
 # Baseline reference data
@@ -92,16 +93,13 @@ def sample_job_attributes(rng: np.random.Generator, job_id: int, arrival_time: f
     )
     subtype = rng.choice(subtypes)
 
-    # Processing time (log-normal)
     mu, sigma = lognormal_params(proc_mean, proc_cv)
     processing_time = rng.lognormal(mu, sigma)
 
-    # Quality risk factor (Beta(2,2) scaled to [0,2])
     quality_risk = 2.0 * rng.beta(2, 2)
 
     complexity_score = base_complexity + quality_risk
 
-    # Priority level: combination of priority weight and complexity
     norm_complexity = complexity_score / 7.0
     priority_level = 0.6 * priority_weight + 0.4 * (norm_complexity * 5)
 
@@ -140,13 +138,64 @@ class WorkCenter:
         self.hourly_records = []
 
         self.job_counter = 0
+        self.frames = []
+        self.frame_interval = 1.0
+        self._last_frame_time = -1
 
         for m in range(params.n_machines):
             env.process(self.machine_breakdown_process(m))
 
         env.process(self.monitor_process())
 
-    # ---------- Arrivals (Poisson process) ----------
+    def _record_visual_frame(self):
+        """ Record a snapshot of the current state for the web visualizer."""
+        frame = {
+            "time": self.env.now,
+            "machines": [],
+            "buffer": [],
+            "rejections": self.rejection_counts,
+            "completed_count": self.completed_count,
+            "utilization": sum(1 for f in self.machine_free if not f) / self.p.n_machines,
+            "queue_length": len(self.buffer)
+        }
+        # machines
+        for idx in range(self.p.n_machines):
+            job = self.machine_current_job[idx]
+            status = "idle"
+            if self.machine_down[idx]:
+                status = "down" if self.machine_free[idx] else "repair"
+            elif not self.machine_free[idx]:
+                status = "busy"
+            progress = 0.0
+            if job and job.start_time:
+                elapsed = self.env.now - job.start_time
+                total = job.processing_time
+                progress = min(1.0, elapsed / total) if total > 0 else 0
+            frame["machines"].append({
+                "id": idx,
+                "status": status,
+                "job": {
+                    "id": job.job_id,
+                    "priorityClass": job.priority_class,
+                    "jobType": job.job_type
+                } if job else None,
+                "progress": progress,
+                "repairTimeLeft": 0.0 
+            })
+        
+        # buffer
+        for job in self.buffer:
+            timeout_remaining = max(0, job.timeout_deadline - self.env.now) if hasattr(job, "timeout_deadline") else job.safe_wait_mean
+            frame["buffer"].append({
+                "id": job.job_id,
+                "priorityClass": job.priority_class,
+                "priorityLevel": job.priority_level,
+                "jobType": job.job_type,
+                "timeoutRemaining": timeout_remaining,
+                "safeWaitMean": job.safe_wait_mean
+            })
+        self.frames.append(frame)
+        
     def job_generator(self):
         while self.env.now < self.p.horizon_hours:
             interarrival = self.rng.exponential(self.p.arrival_mean)
@@ -256,7 +305,7 @@ class WorkCenter:
         job.rejection_time = self.env.now
         job.rejection_reason = reason
 
-    # ---------- Machine breakdown process ----------
+    # Machine Breakdown Process
     def machine_breakdown_process(self, machine_id: int):
         while True:
             time_to_failure = self.rng.exponential(self.p.mtbf_mean)
@@ -281,7 +330,8 @@ class WorkCenter:
                 self.machine_free[machine_id] = True
                 self.pull_next_job(machine_id)
 
-    # ---------- Hourly monitoring ----------
+
+    # Hourly monitoring (generate csv files and web visulaizer frames)
     def monitor_process(self):
         while True:
             machines_busy = sum(1 for f in self.machine_free if not f)
@@ -304,6 +354,9 @@ class WorkCenter:
                 "over_capacity_pressure": over_capacity_pressure,
                 "machines_down": machines_down_count,
             })
+            if self.env.now - self._last_frame_time >= self.frame_interval:
+                self._record_visual_frame()
+                self._last_frame_time = self.env.now
             yield self.env.timeout(1.0)
 
 
@@ -348,6 +401,8 @@ def run_single_replication(params: ScenarioParams, seed: int) -> Dict:
     hourly_df = pd.DataFrame(wc.hourly_records)
 
     metrics = compute_metrics(job_df, hourly_df, params)
+    with open(f"../data/frames_{params.name}_seed_{str(seed)}.json", "w") as f:
+        json.dump(wc.frames, f, indent=2)
     return {"job_df": job_df, "hourly_df": hourly_df, "metrics": metrics}
 
 
