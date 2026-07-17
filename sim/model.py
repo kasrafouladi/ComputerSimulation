@@ -342,8 +342,6 @@ def run_single_replication(params: ScenarioParams, seed: int) -> Dict:
             "wait_to_machine": wait_to_machine,
             "total_time_in_system": total_time,
             "rejection_reason": job.rejection_reason,
-            "rejection_time": job.rejection_time,
-        "processing_time": job.processing_time,
         })
 
     job_df = pd.DataFrame(job_rows)

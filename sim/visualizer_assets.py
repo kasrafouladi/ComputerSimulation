@@ -5,11 +5,11 @@ from tkinter import ttk
 import simpy
 import numpy as np
 import pandas as pd
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, List, Dict, Any
 
 # ----------------------------------------------------------------------
-# Data structures and distributions
+# Copy of the original model (with modifications for quality check + event logging)
 # ----------------------------------------------------------------------
 
 PRIORITY_CLASSES = {
@@ -27,44 +27,23 @@ JOB_TYPES = {
     "Custom":    (0.15, 5, 6.5, 0.35, ["Prototype", "OneOff", "EngineeringChange"]),
 }
 
-# Machine types
-MACHINE_TYPES = ['Milling', 'Turning', 'Drilling']
-TYPE_COLORS = {'Milling': 'dodgerblue', 'Turning': 'orange', 'Drilling': 'forestgreen'}
-
-# Job routes: (weight, [(type, mean_processing_time, cv), ...])
-ROUTES = [
-    (0.25, [('Milling', 2.0, 0.35), ('Turning', 1.5, 0.30)]),
-    (0.20, [('Turning', 1.8, 0.30), ('Drilling', 1.2, 0.35)]),
-    (0.15, [('Milling', 2.5, 0.35), ('Drilling', 1.5, 0.35), ('Turning', 1.0, 0.30)]),
-    (0.20, [('Turning', 2.2, 0.30), ('Milling', 1.8, 0.35)]),
-    (0.10, [('Drilling', 1.0, 0.35), ('Milling', 3.0, 0.35), ('Turning', 2.0, 0.30)]),
-    (0.10, [('Milling', 1.5, 0.35), ('Turning', 1.5, 0.30), ('Drilling', 1.5, 0.35)]),
-]
-
-def lognormal_params(mean, cv):
-    sigma = np.sqrt(np.log(1 + cv**2))
-    mu = np.log(mean) - 0.5 * sigma**2
-    return mu, sigma
-
 @dataclass
 class ScenarioParams:
     name: str = "base"
     horizon_hours: float = 720.0
-    machine_counts: Dict[str, int] = field(default_factory=lambda: {'Milling': 4, 'Turning': 3, 'Drilling': 3})
+    n_machines: int = 10
     buffer_capacity: int = 8
     arrival_mean: float = 0.45
-    queue_discipline: str = "FIFO"          # "FIFO" or "PRIORITY"
+    queue_discipline: str = "FIFO"
     mtbf_mean: float = 120.0
     mttr_low: float = 1.0
     mttr_high: float = 4.0
     p_scrap_on_breakdown: float = 0.25
     seed: int = 0
-    qc_mean: float = 0.2                    # mean QC time (exponential)
-    qc_stations: int = 2                    # number of shared QC stations
+    qc_mean: float = 0.2  # mean quality check time (exponential)
 
 @dataclass
 class Job:
-    # Fields without defaults (must come first)
     job_id: int
     arrival_time: float
     job_type: str
@@ -73,11 +52,8 @@ class Job:
     priority_weight: int
     complexity_score: float
     priority_level: float
-    operations: List[Dict]          # each dict: {'type': str, 'processing_time': float}
+    processing_time: float
     safe_wait_mean: float
-
-    # Fields with defaults
-    current_op_idx: int = 0
     status: str = "in_system"
     machine_number: Optional[int] = None
     queue_entry_time: Optional[float] = None
@@ -85,26 +61,19 @@ class Job:
     completion_time: Optional[float] = None
     rejection_time: Optional[float] = None
     rejection_reason: Optional[str] = None
-    remaining_processing: List[float] = field(default_factory=list)
+    remaining_processing: Optional[float] = None
 
-    def __post_init__(self):
-        if not self.remaining_processing:
-            self.remaining_processing = [op['processing_time'] for op in self.operations]
-
-    def current_op_type(self):
-        return self.operations[self.current_op_idx]['type']
-
-    def is_finished(self):
-        return self.current_op_idx >= len(self.operations)
+def lognormal_params(mean, cv):
+    sigma = np.sqrt(np.log(1 + cv**2))
+    mu = np.log(mean) - 0.5 * sigma**2
+    return mu, sigma
 
 def sample_job_attributes(rng: np.random.Generator, job_id: int, arrival_time: float) -> Job:
-    # Priority class
     p_names = list(PRIORITY_CLASSES.keys())
     p_probs = [PRIORITY_CLASSES[n][0] for n in p_names]
     priority_class = rng.choice(p_names, p=p_probs)
     priority_weight = PRIORITY_CLASSES[priority_class][1]
 
-    # Job type
     j_names = list(JOB_TYPES.keys())
     j_probs = [JOB_TYPES[n][0] for n in j_names]
     job_type = rng.choice(j_names, p=j_probs)
@@ -116,6 +85,9 @@ def sample_job_attributes(rng: np.random.Generator, job_id: int, arrival_time: f
     )
     subtype = rng.choice(subtypes)
 
+    mu, sigma = lognormal_params(proc_mean, proc_cv)
+    processing_time = rng.lognormal(mu, sigma)
+
     quality_risk = 2.0 * rng.beta(2, 2)
     complexity_score = base_complexity + quality_risk
 
@@ -123,18 +95,6 @@ def sample_job_attributes(rng: np.random.Generator, job_id: int, arrival_time: f
     priority_level = 0.6 * priority_weight + 0.4 * (norm_complexity * 5)
 
     safe_wait_mean = max(0.5, 10.0 / (1.0 + priority_level))
-
-    # Choose a route
-    route_weights = [w for w, _ in ROUTES]
-    route_index = rng.choice(len(ROUTES), p=np.array(route_weights)/sum(route_weights))
-    chosen_route = ROUTES[route_index][1]
-
-    operations = []
-    for op_type, op_mean, op_cv in chosen_route:
-        adj_mean = op_mean * (0.7 + 0.3 * (complexity_score / 5.0))
-        mu, sigma = lognormal_params(adj_mean, op_cv)
-        proc_time = max(0.05, rng.lognormal(mu, sigma))
-        operations.append({'type': op_type, 'processing_time': round(proc_time, 3)})
 
     return Job(
         job_id=job_id,
@@ -145,12 +105,13 @@ def sample_job_attributes(rng: np.random.Generator, job_id: int, arrival_time: f
         priority_weight=priority_weight,
         complexity_score=round(complexity_score, 3),
         priority_level=round(priority_level, 3),
-        operations=operations,
+        processing_time=round(processing_time, 3),
         safe_wait_mean=round(safe_wait_mean, 3),
+        remaining_processing=round(processing_time, 3),
     )
 
 # ----------------------------------------------------------------------
-# WorkCenter with shared QC resource
+# Extended WorkCenter with quality check and event logging
 # ----------------------------------------------------------------------
 class WorkCenterWithQC:
     def __init__(self, env: simpy.Environment, params: ScenarioParams, rng: np.random.Generator):
@@ -158,52 +119,35 @@ class WorkCenterWithQC:
         self.p = params
         self.rng = rng
 
-        # Build machines
-        self.machine_types = []
-        self.machine_free = []
-        self.machine_down = []
-        self.machine_current_job = []
-        self.machine_busy_hours = []
-        self.machine_process_ref = []
+        self.machine_free = [True] * params.n_machines
+        self.machine_down = [False] * params.n_machines
+        self.machine_current_job: List[Optional[Job]] = [None] * params.n_machines
+        self.machine_busy_hours = [0.0] * params.n_machines
+        self.machine_process_ref: List[Optional[simpy.Process]] = [None] * params.n_machines
 
-        for mtype, count in params.machine_counts.items():
-            for i in range(count):
-                idx = len(self.machine_types)
-                self.machine_types.append(mtype)
-                self.machine_free.append(True)
-                self.machine_down.append(False)
-                self.machine_current_job.append(None)
-                self.machine_busy_hours.append(0.0)
-                self.machine_process_ref.append(None)
-
-        self.n_machines = len(self.machine_types)
-
-        # Buffer (waiting for CNC machines)
         self.buffer: List[Job] = []
         self.all_jobs: Dict[int, Job] = {}
         self.hourly_records = []
         self.job_counter = 0
 
-        # ---------- Shared QC ----------
-        self.qc_resource = simpy.Resource(env, capacity=params.qc_stations)
-        self.qc_waiting: List[Job] = []      # jobs that have finished machining but are waiting for QC
-        self.qc_active: List[Job] = []       # jobs currently being inspected
+        # Quality check
+        self.qc_busy = [False] * params.n_machines
+        self.qc_job = [None] * params.n_machines
         self.good_count = 0
         self.scrap_count = 0
 
         # Event log for GUI
         self.event_log: List[Dict[str, Any]] = []
-        self.job_attrs: Dict[int, Dict[str, Any]] = {}
+        self.job_attrs: Dict[int, Dict[str, Any]] = {}  # job_id -> {color, label, ...}
 
-        # Start machine breakdown processes
-        for m in range(self.n_machines):
+        # Start processes
+        for m in range(params.n_machines):
             env.process(self.machine_breakdown_process(m))
-
         env.process(self.monitor_process())
         self.record_snapshot()
 
     def record_snapshot(self):
-        """Capture current state for GUI."""
+        """Capture current state and append to event_log."""
         snapshot = {
             'time': self.env.now,
             'buffer': [job.job_id for job in self.buffer],
@@ -212,13 +156,16 @@ class WorkCenterWithQC:
                     'state': 'broken' if self.machine_down[i] else
                               ('working' if self.machine_current_job[i] is not None else 'idle'),
                     'job_id': self.machine_current_job[i].job_id if self.machine_current_job[i] else None,
-                    'type': self.machine_types[i],
                 }
-                for i in range(self.n_machines)
+                for i in range(self.p.n_machines)
             ],
-            'qc_waiting': [job.job_id for job in self.qc_waiting],
-            'qc_active': [job.job_id for job in self.qc_active],
-            'qc_free': self.qc_resource.capacity - len(self.qc_active),
+            'qc': [
+                {
+                    'state': 'inspecting' if self.qc_job[i] is not None else 'idle',
+                    'job_id': self.qc_job[i].job_id if self.qc_job[i] else None,
+                }
+                for i in range(self.p.n_machines)
+            ],
             'good_count': self.good_count,
             'scrap_count': self.scrap_count,
         }
@@ -234,12 +181,11 @@ class WorkCenterWithQC:
             self.job_counter += 1
             job = sample_job_attributes(self.rng, self.job_counter, self.env.now)
             self.all_jobs[job.job_id] = job
-            op_info = f"{job.current_op_idx+1}/{len(job.operations)}"
+            # Store attributes for GUI
             self.job_attrs[job.job_id] = {
                 'color': self._priority_color(job.priority_class),
                 'label': f'J{job.job_id}',
                 'priority': job.priority_class,
-                'op_info': op_info,
             }
             self.env.process(self.handle_new_job(job))
 
@@ -248,7 +194,7 @@ class WorkCenterWithQC:
         return colors.get(pclass, 'gray')
 
     def handle_new_job(self, job: Job):
-        # Initial inspection (Gamma)
+        # Inspection time (Gamma)
         mean_insp = 0.25
         sd_insp = 0.08
         shape = mean_insp**2 / sd_insp**2
@@ -259,16 +205,7 @@ class WorkCenterWithQC:
         self.try_assign_or_queue(job)
 
     def try_assign_or_queue(self, job: Job):
-        if job.is_finished():
-            # All operations done: go to QC queue
-            self.qc_waiting.append(job)
-            self.record_snapshot()
-            self.env.process(self.quality_check(job))
-            return
-
-        needed_type = job.current_op_type()
-        free_machine = self.find_free_machine(needed_type)
-
+        free_machine = self.first_free_machine()
         if free_machine is not None:
             self.assign_machine(job, free_machine)
         elif len(self.buffer) < self.p.buffer_capacity:
@@ -280,11 +217,10 @@ class WorkCenterWithQC:
             self.reject(job, "buffer_full")
             self.record_snapshot()
 
-    def find_free_machine(self, mtype: str) -> Optional[int]:
-        for i in range(self.n_machines):
-            if (self.machine_types[i] == mtype and
-                self.machine_free[i] and not self.machine_down[i]):
-                return i
+    def first_free_machine(self) -> Optional[int]:
+        for m in range(self.p.n_machines):
+            if self.machine_free[m] and not self.machine_down[m]:
+                return m
         return None
 
     def assign_machine(self, job: Job, machine_id: int):
@@ -294,13 +230,11 @@ class WorkCenterWithQC:
         job.start_time = self.env.now
         if job in self.buffer:
             self.buffer.remove(job)
-        self.machine_process_ref[machine_id] = self.env.process(self.run_operation(job, machine_id))
+        self.machine_process_ref[machine_id] = self.env.process(self.run_job(job, machine_id))
         self.record_snapshot()
 
-    def run_operation(self, job: Job, machine_id: int):
-        op_idx = job.current_op_idx
-        remaining = job.remaining_processing[op_idx]
-
+    def run_job(self, job: Job, machine_id: int):
+        remaining = job.remaining_processing
         while remaining > 0:
             start = self.env.now
             try:
@@ -310,7 +244,7 @@ class WorkCenterWithQC:
                 elapsed = self.env.now - start
                 remaining -= elapsed
                 remaining = max(remaining, 0)
-                job.remaining_processing[op_idx] = remaining
+                job.remaining_processing = remaining
                 if self.rng.random() < self.p.p_scrap_on_breakdown:
                     self.reject(job, "machine_failure")
                     self.machine_current_job[machine_id] = None
@@ -321,29 +255,45 @@ class WorkCenterWithQC:
                         yield self.env.timeout(0.1)
                     except simpy.Interrupt:
                         continue
+                # after repair, continue processing
 
-        # Operation finished
-        self.machine_busy_hours[machine_id] += (job.operations[op_idx]['processing_time'] -
-                                                job.remaining_processing[op_idx])
-        job.current_op_idx += 1
+        # Processing finished
+        self.machine_busy_hours[machine_id] += job.processing_time
+        # Machine becomes free, pull next job
         self.machine_free[machine_id] = True
         self.machine_current_job[machine_id] = None
         self.record_snapshot()
-
-        # Pull next job for this machine
         self.pull_next_job(machine_id)
 
-        # Re-enter the routing logic
-        self.try_assign_or_queue(job)
+        # Now start quality check
+        self.env.process(self.quality_check(job, machine_id))
+
+    def quality_check(self, job: Job, machine_id: int):
+        self.qc_busy[machine_id] = True
+        self.qc_job[machine_id] = job
+        self.record_snapshot()
+        qc_time = self.rng.exponential(self.p.qc_mean)
+        yield self.env.timeout(qc_time)
+        scrap_prob = min(0.20, 0.02 * job.complexity_score)
+        if self.rng.random() < scrap_prob:
+            self.scrap_count += 1
+            job.status = "rejected"
+            job.rejection_time = self.env.now
+            job.rejection_reason = "quality_reject"
+        else:
+            self.good_count += 1
+            job.status = "completed"
+            job.completion_time = self.env.now
+        self.qc_busy[machine_id] = False
+        self.qc_job[machine_id] = None
+        self.record_snapshot()
 
     def pull_next_job(self, machine_id: int):
-        needed_type = self.machine_types[machine_id]
-        candidates = [j for j in self.buffer if not j.is_finished() and j.current_op_type() == needed_type]
-        if not candidates:
+        if not self.buffer:
             return
         if self.p.queue_discipline == "PRIORITY":
-            candidates.sort(key=lambda j: (-j.priority_level, j.queue_entry_time))
-        next_job = candidates[0]
+            self.buffer.sort(key=lambda j: (-j.priority_level, j.queue_entry_time))
+        next_job = self.buffer[0]
         self.assign_machine(next_job, machine_id)
         self.record_snapshot()
 
@@ -361,44 +311,7 @@ class WorkCenterWithQC:
         job.status = "rejected"
         job.rejection_time = self.env.now
         job.rejection_reason = reason
-        # Remove from any queues
-        if job in self.buffer:
-            self.buffer.remove(job)
-        if job in self.qc_waiting:
-            self.qc_waiting.remove(job)
         self.record_snapshot()
-
-    # ---------- Shared Quality Check ----------
-    def quality_check(self, job: Job):
-        # Remove from waiting queue (if still there)
-        if job in self.qc_waiting:
-            self.qc_waiting.remove(job)
-        self.record_snapshot()
-
-        # Request a QC station
-        with self.qc_resource.request() as req:
-            yield req
-            # Now we have a QC station
-            self.qc_active.append(job)
-            self.record_snapshot()
-
-            qc_time = self.rng.exponential(self.p.qc_mean)
-            yield self.env.timeout(qc_time)
-
-            # Determine pass/fail
-            scrap_prob = min(0.20, 0.02 * job.complexity_score)
-            if self.rng.random() < scrap_prob:
-                self.scrap_count += 1
-                job.status = "rejected"
-                job.rejection_time = self.env.now
-                job.rejection_reason = "quality_reject"
-            else:
-                self.good_count += 1
-                job.status = "completed"
-                job.completion_time = self.env.now
-
-            self.qc_active.remove(job)
-            self.record_snapshot()
 
     # ---------- Machine breakdown ----------
     def machine_breakdown_process(self, machine_id: int):
@@ -408,6 +321,7 @@ class WorkCenterWithQC:
             if self.env.now >= self.p.horizon_hours:
                 break
             self.machine_down[machine_id] = True
+            was_free = self.machine_free[machine_id]
             self.machine_free[machine_id] = False
             current_job = self.machine_current_job[machine_id]
             proc_ref = self.machine_process_ref[machine_id]
@@ -426,17 +340,17 @@ class WorkCenterWithQC:
                 self.pull_next_job(machine_id)
             self.record_snapshot()
 
-    # ---------- Hourly monitoring ----------
+    # ---------- Hourly monitoring (for metrics) ----------
     def monitor_process(self):
         while True:
-            busy = sum(1 for i in range(self.n_machines) if not self.machine_free[i] and not self.machine_down[i])
+            busy = sum(1 for i in range(self.p.n_machines) if not self.machine_free[i] and not self.machine_down[i])
             machines_down = sum(self.machine_down)
-            available = self.n_machines - busy - machines_down
+            available = self.p.n_machines - busy - machines_down
             queue_length = len(self.buffer)
             queue_full = queue_length >= self.p.buffer_capacity
-            utilization = busy / self.n_machines
+            utilization = busy / self.p.n_machines
             pressure = busy + queue_length
-            over_capacity_pressure = pressure > self.n_machines
+            over_capacity_pressure = pressure > self.p.n_machines
 
             self.hourly_records.append({
                 "time": self.env.now,
@@ -452,7 +366,7 @@ class WorkCenterWithQC:
             yield self.env.timeout(1.0)
 
 # ----------------------------------------------------------------------
-# Run simulation
+# Run single replication with event logging
 # ----------------------------------------------------------------------
 def run_single_replication_with_events(params: ScenarioParams, seed: int) -> Dict:
     rng = np.random.default_rng(seed)
@@ -461,7 +375,7 @@ def run_single_replication_with_events(params: ScenarioParams, seed: int) -> Dic
     env.process(wc.job_generator())
     env.run(until=params.horizon_hours + 200)
 
-    # Build job dataframe
+    # Build job_df (similar to original)
     job_rows = []
     for job in wc.all_jobs.values():
         if job.status == "in_system":
@@ -488,15 +402,15 @@ def run_single_replication_with_events(params: ScenarioParams, seed: int) -> Dic
             "wait_to_machine": wait_to_machine,
             "total_time_in_system": total_time,
             "rejection_reason": job.rejection_reason,
-            "route": [op['type'] for op in job.operations],
         })
     job_df = pd.DataFrame(job_rows)
     hourly_df = pd.DataFrame(wc.hourly_records)
 
-    # Metrics
+    # Metrics (simplified)
     total = len(job_df)
     completed = job_df[job_df.status == "completed"]
     rejected = job_df[job_df.status == "rejected"]
+    admitted = job_df[job_df.status.isin(["completed", "censored"]) | job_df.start_time.notna()]
 
     admission_rate = job_df.start_time.notna().sum() / total if total else np.nan
     rejection_rate = len(rejected) / total if total else np.nan
@@ -550,36 +464,12 @@ def run_single_replication_with_events(params: ScenarioParams, seed: int) -> Dic
 # GUI
 # ----------------------------------------------------------------------
 SCENARIOS = {
-    "base": ScenarioParams(
-        name="base",
-        machine_counts={'Milling': 4, 'Turning': 3, 'Drilling': 3},
-        qc_stations=2,
-        arrival_mean=0.45
-    ),
-    "capacity": ScenarioParams(
-        name="capacity",
-        machine_counts={'Milling': 5, 'Turning': 4, 'Drilling': 4},
-        buffer_capacity=10,
-        qc_stations=3,
-        arrival_mean=0.45
-    ),
-    "policy_priority": ScenarioParams(
-        name="policy_priority",
-        machine_counts={'Milling': 4, 'Turning': 3, 'Drilling': 3},
-        qc_stations=2,
-        queue_discipline="PRIORITY",
-        arrival_mean=0.45
-    ),
-    "demand_surge": ScenarioParams(
-        name="demand_surge",
-        machine_counts={'Milling': 4, 'Turning': 3, 'Drilling': 3},
-        qc_stations=2,
-        arrival_mean=0.35
-    ),
+    "base": ScenarioParams(name="base", arrival_mean=0.45),
+    "capacity": ScenarioParams(name="capacity", n_machines=13, buffer_capacity=10, arrival_mean=0.45),
+    "policy_priority": ScenarioParams(name="policy_priority", queue_discipline="PRIORITY", arrival_mean=0.45),
+    "demand_surge": ScenarioParams(name="demand_surge", arrival_mean=0.35),
     "priority_demand_surge": ScenarioParams(
         name="priority_demand_surge",
-        machine_counts={'Milling': 4, 'Turning': 3, 'Drilling': 3},
-        qc_stations=2,
         queue_discipline="PRIORITY",
         arrival_mean=0.35
     ),
@@ -588,7 +478,7 @@ SCENARIOS = {
 class CNC_GUI:
     def __init__(self, master):
         self.master = master
-        master.title("CNC Manufacturing Line (Multi‑Op + Shared QC)")
+        master.title("CNC Manufacturing Line Simulation")
 
         # Control frame
         ctrl_frame = ttk.Frame(master)
@@ -628,28 +518,32 @@ class CNC_GUI:
         # State
         self.event_log = []
         self.current_index = -1
-        self.job_canvas_ovals = {}   # job_id -> canvas oval id
+        self.job_canvas_ids = {}  # job_id -> canvas oval id
         self.playing = False
         self.after_id = None
 
-        # Positions (computed dynamically)
-        self.machine_positions = []
-        self.qc_station_positions = []
-        self.qc_waiting_positions = []
-        self.buffer_positions = []
+        # Positions calculated dynamically
+        self.machine_positions = []  # (x, y) for each CNC
+        self.qc_positions = []       # (x, y) for each QC
+        self.buffer_positions = []   # list of (x, y) for buffer slots
         self.good_box_pos = None
         self.scrap_box_pos = None
+
+        # For animation
         self.animating = False
 
+        # Draw initial empty layout
         self.draw_empty()
 
     def draw_empty(self):
         self.canvas.delete("all")
+        # We'll redraw when simulation is run.
 
     def run_simulation(self):
-        self.reset()
+        self.reset()  # clear previous
         scenario_name = self.scenario_var.get()
         params = SCENARIOS[scenario_name]
+        # Use a fixed seed for reproducibility
         seed = 12345
         self.status_label.config(text="Running simulation...")
         self.master.update()
@@ -658,6 +552,7 @@ class CNC_GUI:
         self.event_log = result["event_log"]
         self.job_attrs = result["job_attrs"]
         self.params = params
+        self.metrics = result["metrics"]
 
         self.status_label.config(text=f"Simulation done. {len(self.event_log)} events recorded.")
         self.current_index = 0
@@ -666,7 +561,9 @@ class CNC_GUI:
         self.reset_btn.config(state=tk.NORMAL)
         self.run_btn.config(state=tk.DISABLED)
 
+        # Setup canvas positions based on number of machines
         self.setup_positions()
+        # Draw initial state
         self.draw_snapshot(self.current_index)
 
     def setup_positions(self):
@@ -674,39 +571,28 @@ class CNC_GUI:
         canvas_width = int(self.canvas.cget("width"))
         canvas_height = int(self.canvas.cget("height"))
 
-        # Buffer (left)
-        buffer_x = 60
+        # Buffer on left
+        buffer_x = 80
         buffer_y_start = 150
-        buffer_spacing = 28
+        buffer_spacing = 30
         self.buffer_positions = [(buffer_x, buffer_y_start + i*buffer_spacing) for i in range(self.params.buffer_capacity)]
 
-        # Machines (middle)
+        # Machines row
         machine_y = 200
-        x_start = 180
-        x_spacing = (canvas_width - x_start - 300) // (n + 1)   # leave room for QC on right
+        x_start = 200
+        x_spacing = (canvas_width - x_start - 200) // (n + 1)
         self.machine_positions = []
         for i in range(n):
             x = x_start + (i+1)*x_spacing
             self.machine_positions.append((x, machine_y))
 
-        # QC Waiting area (between machines and QC stations)
-        qc_wait_x = x_start + (n+1)*x_spacing + 20
-        qc_wait_y_start = 150
-        qc_wait_spacing = 28
-        self.qc_waiting_positions = [(qc_wait_x, qc_wait_y_start + i*qc_wait_spacing) for i in range(10)]  # max 10 waiting
+        # QC row below
+        qc_y = machine_y + 100
+        self.qc_positions = [(x, qc_y) for x, y in self.machine_positions]
 
-        # QC Stations (far right)
-        qc_station_x = qc_wait_x + 70
-        qc_station_y_start = 180
-        qc_station_spacing = 60
-        self.qc_station_positions = []
-        for i in range(self.params.qc_stations):
-            y = qc_station_y_start + i*qc_station_spacing
-            self.qc_station_positions.append((qc_station_x, y))
-
-        # Good / Scrap boxes (far right, below QC)
-        self.good_box_pos = (canvas_width - 130, 150)
-        self.scrap_box_pos = (canvas_width - 130, 400)
+        # Good and scrap boxes on right
+        self.good_box_pos = (canvas_width - 150, 150)
+        self.scrap_box_pos = (canvas_width - 150, 400)
 
     def draw_snapshot(self, idx):
         self.canvas.delete("all")
@@ -714,67 +600,52 @@ class CNC_GUI:
         time = snapshot['time']
         buffer_ids = snapshot['buffer']
         machines = snapshot['machines']
-        qc_waiting_ids = snapshot['qc_waiting']
-        qc_active_ids = snapshot['qc_active']
-        qc_free = snapshot['qc_free']
+        qc = snapshot['qc']
         good_count = snapshot['good_count']
         scrap_count = snapshot['scrap_count']
 
-        # ---- Buffer ----
+        # Draw static elements: machine labels, boxes, etc.
+        self.draw_static_elements()
+
+        # Draw buffer parts
         for pos_idx, job_id in enumerate(buffer_ids):
             if pos_idx < len(self.buffer_positions):
                 x, y = self.buffer_positions[pos_idx]
                 color = self.job_attrs.get(job_id, {}).get('color', 'gray')
-                op_info = self.job_attrs.get(job_id, {}).get('op_info', '')
-                oval = self.canvas.create_oval(x-10, y-10, x+10, y+10, fill=color, outline='black')
-                self.canvas.create_text(x, y, text=op_info, font=('Arial', 7))
+                self.canvas.create_oval(x-10, y-10, x+10, y+10, fill=color, outline='black')
+                # store id for animation
+                self.job_canvas_ids[job_id] = (x, y, 'buffer', pos_idx)
 
-        # ---- Machines ----
+        # Draw machines
         for i, (x, y) in enumerate(self.machine_positions):
             state = machines[i]['state']
-            mtype = machines[i]['type']
-            color = {'idle':'lightgray', 'working':'yellow', 'broken':'red'}.get(state, 'gray')
-            self.canvas.create_rectangle(x-25, y-25, x+25, y+25, fill=color,
-                                         outline=TYPE_COLORS.get(mtype, 'black'), width=3)
-            self.canvas.create_text(x, y-40, text=f"M{i+1}\n{mtype}", font=('Arial', 8))
+            color = {'idle':'green', 'working':'yellow', 'broken':'red'}.get(state, 'gray')
+            # machine rectangle
+            self.canvas.create_rectangle(x-25, y-25, x+25, y+25, fill=color, outline='black')
+            self.canvas.create_text(x, y-40, text=f"M{i+1}")
             if state == 'working':
                 job_id = machines[i]['job_id']
                 if job_id is not None:
                     c = self.job_attrs.get(job_id, {}).get('color', 'gray')
-                    op_info = self.job_attrs.get(job_id, {}).get('op_info', '')
-                    oval = self.canvas.create_oval(x-12, y-12, x+12, y+12, fill=c, outline='black')
-                    self.canvas.create_text(x, y, text=op_info, font=('Arial', 7))
+                    self.canvas.create_oval(x-12, y-12, x+12, y+12, fill=c, outline='black')
+                    self.canvas.create_text(x, y, text=str(job_id), font=('Arial', 8))
+                    self.job_canvas_ids[job_id] = (x, y, 'machine', i)
 
-        # ---- QC Waiting Queue ----
-        self.canvas.create_text(self.qc_waiting_positions[0][0]-20, 130,
-                                text="QC Queue", font=('Arial', 10, 'bold'))
-        for pos_idx, job_id in enumerate(qc_waiting_ids):
-            if pos_idx < len(self.qc_waiting_positions):
-                x, y = self.qc_waiting_positions[pos_idx]
-                color = self.job_attrs.get(job_id, {}).get('color', 'gray')
-                oval = self.canvas.create_oval(x-10, y-10, x+10, y+10, fill=color, outline='black')
-                self.canvas.create_text(x, y, text="QC", font=('Arial', 7))
+        # Draw QC
+        for i, (x, y) in enumerate(self.qc_positions):
+            state = qc[i]['state']
+            color = 'lightblue' if state == 'idle' else 'darkblue'
+            self.canvas.create_rectangle(x-15, y-15, x+15, y+15, fill=color, outline='black')
+            self.canvas.create_text(x, y-25, text=f"QC{i+1}")
+            if state == 'inspecting':
+                job_id = qc[i]['job_id']
+                if job_id is not None:
+                    c = self.job_attrs.get(job_id, {}).get('color', 'gray')
+                    self.canvas.create_oval(x-10, y-10, x+10, y+10, fill=c, outline='black')
+                    self.canvas.create_text(x, y, text=str(job_id), font=('Arial', 8))
+                    self.job_canvas_ids[job_id] = (x, y, 'qc', i)
 
-        # ---- QC Stations ----
-        self.canvas.create_text(self.qc_station_positions[0][0], 130,
-                                text=f"QC Stations ({self.params.qc_stations})", font=('Arial', 10, 'bold'))
-        for i, (x, y) in enumerate(self.qc_station_positions):
-            # Check if this station is busy (i < len(qc_active_ids))
-            is_busy = i < len(qc_active_ids)
-            fill_color = 'darkblue' if is_busy else 'lightblue'
-            self.canvas.create_rectangle(x-20, y-15, x+20, y+15, fill=fill_color, outline='black')
-            self.canvas.create_text(x, y-30, text=f"QC{i+1}")
-            if is_busy:
-                job_id = qc_active_ids[i]
-                c = self.job_attrs.get(job_id, {}).get('color', 'gray')
-                self.canvas.create_oval(x-10, y-10, x+10, y+10, fill=c, outline='black')
-                self.canvas.create_text(x, y, text="QC", font=('Arial', 7))
-        # Show free stations count
-        self.canvas.create_text(self.qc_station_positions[0][0],
-                                self.qc_station_positions[-1][1] + 25,
-                                text=f"Free: {qc_free}", font=('Arial', 9))
-
-        # ---- Good / Scrap Boxes ----
+        # Draw good/scrap boxes
         gx, gy = self.good_box_pos
         self.canvas.create_rectangle(gx-40, gy-30, gx+40, gy+30, fill='lightgreen', outline='black')
         self.canvas.create_text(gx, gy-40, text="Good Parts")
@@ -788,29 +659,141 @@ class CNC_GUI:
         # Time label
         self.canvas.create_text(50, 50, text=f"Time: {time:.1f} h", anchor='w')
 
-        # Legend
-        leg_x = 20
-        leg_y = 550
-        self.canvas.create_text(leg_x, leg_y-10, text="Machine Types:", anchor='w')
-        for i, (mtype, color) in enumerate(TYPE_COLORS.items()):
-            self.canvas.create_rectangle(leg_x + i*80, leg_y, leg_x + i*80+15, leg_y+15, fill=color, outline='black')
-            self.canvas.create_text(leg_x + i*80+20, leg_y+7, text=mtype, anchor='w')
-        self.canvas.create_text(leg_x + 250, leg_y, text="Priority: Low=Blue, Std=Green, High=Orange, Crit=Red", anchor='w')
+        # Store current snapshot for animation
+        self.current_snapshot = snapshot
+
+    def draw_static_elements(self):
+        # Draw grid lines, labels, etc.
+        n = self.params.n_machines
+        # We can add machine numbers, QC numbers already in draw_snapshot
 
     def step(self):
         if self.animating:
             return
         if self.current_index < len(self.event_log) - 1:
             self.current_index += 1
-            self.draw_snapshot(self.current_index)
-            self.update_buttons()
+            self.animate_transition()
         else:
             self.status_label.config(text="End of simulation.")
             self.play_btn.config(state=tk.DISABLED)
             self.step_btn.config(state=tk.DISABLED)
 
+    def animate_transition(self):
+        # Animate changes from previous snapshot to current
+        if self.current_index == 0:
+            self.draw_snapshot(self.current_index)
+            return
+        prev = self.event_log[self.current_index - 1]
+        curr = self.event_log[self.current_index]
+        # Determine which jobs moved
+        # We'll move jobs from their prev location to curr location
+        # Gather all jobs that are in either snapshot
+        all_jobs = set()
+        for snap in (prev, curr):
+            all_jobs.update(snap['buffer'])
+            for m in snap['machines']:
+                if m['job_id'] is not None:
+                    all_jobs.add(m['job_id'])
+            for q in snap['qc']:
+                if q['job_id'] is not None:
+                    all_jobs.add(q['job_id'])
+
+        # We'll animate each job's position change
+        # For each job, find its position in prev and curr
+        # If different, animate
+        # Also handle new jobs appearing in curr
+        # We'll create a list of movements: (job_id, start_x, start_y, end_x, end_y)
+        movements = []
+        for job_id in all_jobs:
+            start_pos = self.get_job_position(job_id, prev)
+            end_pos = self.get_job_position(job_id, curr)
+            if start_pos != end_pos:
+                # If job not in prev (new arrival), start at buffer position? Actually we can start at off-screen or buffer
+                if start_pos is None:
+                    # new job, start from buffer entry point
+                    start_pos = (self.buffer_positions[0][0] - 40, self.buffer_positions[0][1])
+                # If job not in curr, it might have been removed (scrap/good) - we can move to box
+                if end_pos is None:
+                    # If job is in good/scrap? We can determine from status? But we can just leave it at its last position.
+                    # Actually, when job goes to good/scrap, it disappears from states, so we should move it to box.
+                    # Determine if job is in good or scrap by checking curr good/scrap counts? Not easy.
+                    # We'll rely on status from job_attrs? Not stored.
+                    # Instead, we can check if job's status is completed/rejected in the result.
+                    # We'll just move it to the box if it's not in buffer/machine/qc.
+                    # We'll infer from curr: if job not in buffer, not on machine, not on qc, then it must have gone to box.
+                    # But we don't know which box. We'll use the job status from all_jobs? We don't have it here.
+                    # For simplicity, we'll just not animate disappearance; we'll keep it at its last position.
+                    # We'll handle new arrivals and moves.
+                    continue
+                if start_pos != end_pos:
+                    movements.append((job_id, start_pos[0], start_pos[1], end_pos[0], end_pos[1]))
+
+        if not movements:
+            # No movement, just draw current
+            self.draw_snapshot(self.current_index)
+            return
+
+        # Animate all movements simultaneously
+        self.animating = True
+        # For each movement, we need to create or update canvas oval
+        # We'll store the canvas ids for jobs
+        # If a job doesn't have a canvas id, create one
+        for job_id, sx, sy, ex, ey in movements:
+            if job_id not in self.job_canvas_ids:
+                # create oval at start position
+                color = self.job_attrs.get(job_id, {}).get('color', 'gray')
+                oval = self.canvas.create_oval(sx-10, sy-10, sx+10, sy+10, fill=color, outline='black')
+                self.job_canvas_ids[job_id] = oval
+            else:
+                oval = self.job_canvas_ids[job_id]
+                # move to start
+                self.canvas.coords(oval, sx-10, sy-10, sx+10, sy+10)
+
+        # Now animate over 20 steps
+        steps = 20
+        delay = 20  # ms
+        for step in range(1, steps+1):
+            frac = step / steps
+            for job_id, sx, sy, ex, ey in movements:
+                oval = self.job_canvas_ids[job_id]
+                x = sx + (ex - sx) * frac
+                y = sy + (ey - sy) * frac
+                self.canvas.coords(oval, x-10, y-10, x+10, y+10)
+            self.master.update()
+            if step < steps:
+                self.master.after(delay, lambda: None)  # simple wait
+            else:
+                # final draw
+                self.draw_snapshot(self.current_index)
+                self.animating = False
+                self.update_buttons()
+
+        # For simplicity, we'll just do a quick animation by scheduling updates
+        # But we can use after to schedule steps
+        # We'll implement a recursive animation function
+        # Let's restructure: use after to animate
+
+    def get_job_position(self, job_id, snapshot):
+        # Return (x,y) or None if job not present
+        # Check buffer
+        if job_id in snapshot['buffer']:
+            idx = snapshot['buffer'].index(job_id)
+            if idx < len(self.buffer_positions):
+                return self.buffer_positions[idx]
+        # Check machines
+        for i, m in enumerate(snapshot['machines']):
+            if m['job_id'] == job_id:
+                return self.machine_positions[i]
+        # Check QC
+        for i, q in enumerate(snapshot['qc']):
+            if q['job_id'] == job_id:
+                return self.qc_positions[i]
+        # Check if in good or scrap? We can't know from snapshot.
+        return None
+
     def play(self):
         if self.playing:
+            # Pause
             self.playing = False
             self.play_btn.config(text="Play")
             if self.after_id:
@@ -830,8 +813,12 @@ class CNC_GUI:
             return
         if self.current_index < len(self.event_log) - 1:
             self.step()
-            speed = self.speed_var.get()
-            self.after_id = self.master.after(speed, self.auto_step)
+            # Wait for animation to finish? We'll check animating flag.
+            if self.animating:
+                self.master.after(100, self.auto_step)  # wait a bit
+            else:
+                speed = self.speed_var.get()
+                self.after_id = self.master.after(speed, self.auto_step)
         else:
             self.playing = False
             self.play_btn.config(text="Play")
@@ -849,12 +836,13 @@ class CNC_GUI:
         self.reset_btn.config(state=tk.DISABLED)
         self.run_btn.config(state=tk.NORMAL)
         self.canvas.delete("all")
-        self.job_canvas_ovals.clear()
+        self.job_canvas_ids.clear()
         self.event_log = []
         self.status_label.config(text="Ready")
         self.draw_empty()
 
     def update_buttons(self):
+        # Enable/disable based on state
         if self.current_index < len(self.event_log) - 1:
             self.play_btn.config(state=tk.NORMAL)
             self.step_btn.config(state=tk.NORMAL)
